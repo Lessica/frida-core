@@ -34,6 +34,12 @@ mkdir -p "$tmpdir/usr/lib/frida/"
 cp "$agent" "$tmpdir/usr/lib/frida/frida-agent.dylib"
 chmod 755 "$tmpdir/usr/lib/frida/frida-agent.dylib"
 
+devkit=$prefix/Frida.framework
+if [ -d "$devkit" ]; then
+  mkdir -p "$tmpdir/Library/Frameworks/"
+  cp -r "$devkit" "$tmpdir/Library/Frameworks/"
+fi
+
 mkdir -p "$tmpdir/Library/LaunchDaemons/"
 cat >"$tmpdir/Library/LaunchDaemons/re.frida.server.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -94,11 +100,13 @@ cat >"$tmpdir/DEBIAN/extrainst_" <<EOF
 #!/bin/sh
 
 if [ "\$1" = upgrade ]; then
-  launchctl unload /Library/LaunchDaemons/re.frida.server.plist
+  launchctl unload -w /Library/LaunchDaemons/re.frida.server.plist
 fi
 
+sleep 2
+
 if [ "\$1" = install ] || [ "\$1" = upgrade ]; then
-  launchctl load /Library/LaunchDaemons/re.frida.server.plist
+  launchctl load -w /Library/LaunchDaemons/re.frida.server.plist
 fi
 
 exit 0
@@ -108,7 +116,7 @@ cat >"$tmpdir/DEBIAN/prerm" <<EOF
 #!/bin/sh
 
 if [ "\$1" = remove ] || [ "\$1" = purge ]; then
-  launchctl unload /Library/LaunchDaemons/re.frida.server.plist
+  launchctl unload -w /Library/LaunchDaemons/re.frida.server.plist
 fi
 
 exit 0

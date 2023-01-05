@@ -2012,6 +2012,8 @@ guint
 _frida_darwin_helper_backend_inject_into_task (FridaDarwinHelperBackend * self, guint pid, guint task, const gchar * path_or_name, FridaMappedLibraryBlob * blob,
     const gchar * entrypoint, const gchar * data, GError ** error)
 {
+  if (pid <= 1) return 0;
+  
   guint result = 0;
   mach_port_t self_task;
   FridaInjectInstance * instance;

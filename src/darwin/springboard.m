@@ -26,8 +26,17 @@ _frida_get_springboard_api (void)
     id (* objc_get_class_impl) (const gchar * name);
 
     api = g_new0 (FridaSpringboardApi, 1);
+    api->sbs = NULL;
+    
+    if (@available(iOS 15.0, *))
+    {
+      if (!api->sbs)
+        api->sbs = dlopen ("/usr/lib/libAltSpringBoardServices.dylib", RTLD_GLOBAL | RTLD_LAZY);
+    }
 
-    api->sbs = dlopen ("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_GLOBAL | RTLD_LAZY);
+    if (!api->sbs)
+      api->sbs = dlopen ("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_GLOBAL | RTLD_LAZY);
+    
     g_assert (api->sbs != NULL);
 
     api->fbs = dlopen ("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_GLOBAL | RTLD_LAZY);
