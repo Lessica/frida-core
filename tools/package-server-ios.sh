@@ -48,23 +48,14 @@ cat >"$tmpdir/Library/LaunchDaemons/re.frida.server.plist" <<EOF
 <dict>
 	<key>Label</key>
 	<string>re.frida.server</string>
-	<key>Program</key>
-	<string>/usr/sbin/frida-server</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/sbin/frida-server</string>
+		<string>/var/jb/usr/sbin/frida-server</string>
 	</array>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>_MSSafeMode</key>
-		<string>1</string>
-	</dict>
 	<key>UserName</key>
 	<string>root</string>
 	<key>RunAtLoad</key>
 	<true/>
-	<key>LimitLoadToSessionType</key>
-	<string>System</string>
 	<key>KeepAlive</key>
 	<true/>
 	<key>ThrottleInterval</key>
@@ -99,14 +90,19 @@ chmod 644 "$tmpdir/DEBIAN/control"
 cat >"$tmpdir/DEBIAN/extrainst_" <<EOF
 #!/bin/sh
 
+JB_PREFIX=""
+if [ -e /var/jb ]; then
+  JB_PREFIX="/var/jb"
+fi
+
 if [ "\$1" = upgrade ]; then
-  launchctl unload -w /Library/LaunchDaemons/re.frida.server.plist
+  launchctl unload -w "\$JB_PREFIX/Library/LaunchDaemons/re.frida.server.plist"
 fi
 
 sleep 2
 
 if [ "\$1" = install ] || [ "\$1" = upgrade ]; then
-  launchctl load -w /Library/LaunchDaemons/re.frida.server.plist
+  launchctl load -w "\$JB_PREFIX/Library/LaunchDaemons/re.frida.server.plist"
 fi
 
 exit 0
@@ -116,7 +112,7 @@ cat >"$tmpdir/DEBIAN/prerm" <<EOF
 #!/bin/sh
 
 if [ "\$1" = remove ] || [ "\$1" = purge ]; then
-  launchctl unload -w /Library/LaunchDaemons/re.frida.server.plist
+  launchctl unload -w "\$JB_PREFIX/Library/LaunchDaemons/re.frida.server.plist"
 fi
 
 exit 0
