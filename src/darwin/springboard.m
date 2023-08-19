@@ -50,6 +50,8 @@ _frida_get_springboard_api (void)
     if (@available(iOS 15.0, *))
     {
       if (!api->sbs)
+        api->sbs = dlopen ("/var/jb/usr/lib/libAltSpringBoardServices.dylib", RTLD_GLOBAL | RTLD_LAZY);
+      if (!api->sbs)
         api->sbs = dlopen ("/usr/lib/libAltSpringBoardServices.dylib", RTLD_GLOBAL | RTLD_LAZY);
     }
 
