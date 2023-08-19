@@ -78,6 +78,8 @@ frida_test_os (void)
   return FRIDA_TEST_OS_MACOS;
 #elif defined (HAVE_IOS)
   return FRIDA_TEST_OS_IOS;
+#elif defined (HAVE_TVOS)
+  return FRIDA_TEST_OS_TVOS;
 #elif defined (HAVE_ANDROID)
   return FRIDA_TEST_OS_ANDROID;
 #elif defined (HAVE_LINUX)
@@ -118,6 +120,8 @@ frida_test_libc (void)
   return FRIDA_TEST_LIBC_APPLE;
 #elif defined (HAVE_GLIBC)
   return FRIDA_TEST_LIBC_GLIBC;
+#elif defined (HAVE_MUSL)
+  return FRIDA_TEST_LIBC_MUSL;
 #elif defined (HAVE_UCLIBC)
   return FRIDA_TEST_LIBC_UCLIBC;
 #elif defined (HAVE_ANDROID)

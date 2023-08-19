@@ -5,12 +5,13 @@ if [ -z "$FRIDA_VERSION" ]; then
   exit 2
 fi
 
-if [ $# -ne 2 ]; then
-  echo "Usage: $0 path/to/prefix output.deb" > /dev/stderr
+if [ $# -ne 3 ]; then
+  echo "Usage: $0 arch path/to/prefix output.deb" > /dev/stderr
   exit 3
 fi
-prefix=$1
-output_deb=$2
+arch=$1
+prefix=$2
+output_deb=$3
 
 executable=$prefix/usr/bin/frida-server
 if [ ! -f "$executable" ]; then
@@ -54,6 +55,8 @@ cat >"$tmpdir/Library/LaunchDaemons/re.frida.server.plist" <<EOF
 	</array>
 	<key>UserName</key>
 	<string>root</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
@@ -77,7 +80,7 @@ Version: $FRIDA_VERSION
 Priority: optional
 Size: 1337
 Installed-Size: $installed_size
-Architecture: iphoneos-arm
+Architecture: $arch
 Description: Observe and reprogram running programs.
 Homepage: https://frida.re/
 Maintainer: Ole André Vadla Ravnås <oleavr@nowsecure.com>
@@ -119,13 +122,15 @@ exit 0
 EOF
 chmod 755 "$tmpdir/DEBIAN/prerm"
 
-dpkg-deb --root-owner-group --build "$tmpdir" "$output_deb"
+dpkg_options="-Zxz --root-owner-group"
+
+dpkg-deb $dpkg_options --build "$tmpdir" "$output_deb"
 package_size=$(expr $(du -sk "$output_deb" | cut -f1) \* 1024)
 
 sed \
   -e "s,^Size: 1337$,Size: $package_size,g" \
   "$tmpdir/DEBIAN/control" > "$tmpdir/DEBIAN/control_"
 mv "$tmpdir/DEBIAN/control_" "$tmpdir/DEBIAN/control"
-dpkg-deb --root-owner-group --build "$tmpdir" "$output_deb"
+dpkg-deb $dpkg_options --build "$tmpdir" "$output_deb"
 
 rm -rf "$tmpdir"

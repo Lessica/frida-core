@@ -35,7 +35,7 @@ elif host_machine.cpu_family() == 'mips'
     host_abi = 'mips'
   endif
 elif host_machine.cpu_family() == 'mips64'
-  host_arch = 'mips64'
+  host_arch = 'mips'
   if host_machine.endian() == 'little'
     host_abi = 'mips64el'
   else
@@ -45,6 +45,12 @@ else
   host_arch = host_machine.cpu_family()
   host_abi = host_arch
 endif
+host_toolchain = (host_os_family == 'darwin') ? 'apple' : 'gnu'
+gumjs_archs = {
+  'x86': 'ia32',
+  'x86_64': 'x64',
+}
+host_arch_gumjs = gumjs_archs.get(host_arch, host_arch)
 
 c_languages = ['c', 'cpp']
 if host_os_family == 'darwin'
@@ -184,7 +190,6 @@ cpu_defines = [
   ['arm', 'HAVE_ARM'],
   ['arm64', 'HAVE_ARM64'],
   ['mips', 'HAVE_MIPS'],
-  ['mips64', 'HAVE_MIPS'],
 ]
 foreach d : cpu_defines
   if d.get(0) == host_arch
@@ -203,7 +208,8 @@ foreach h : headers
   endif
 endforeach
 
-glibc_src = '''
+if host_os == 'linux'
+  glibc_src = '''
 #include <features.h>
 
 #if defined (__GLIBC__) && !defined (__UCLIBC__)
@@ -211,26 +217,27 @@ glibc_src = '''
 # error Not glibc
 #endif
 '''
-if cc.compiles(glibc_src, name: 'compiling for glibc')
-  cdata.set('HAVE_GLIBC', 1)
-endif
-
-uclibc_src = '''
+  uclibc_src = '''
 #include <features.h>
 
 #if !defined (__UCLIBC__)
 # error Not uClibc
 #endif
 '''
-if cc.compiles(uclibc_src, name: 'compiling for uClibc')
-  cdata.set('HAVE_UCLIBC', 1)
+  if cc.compiles(glibc_src, name: 'compiling for glibc')
+    cdata.set('HAVE_GLIBC', 1)
+  elif cc.compiles(uclibc_src, name: 'compiling for uClibc')
+    cdata.set('HAVE_UCLIBC', 1)
+  else
+    cdata.set('HAVE_MUSL', 1)
+  endif
 endif
 
 if get_option('b_sanitize') == 'address'
   cdata.set('HAVE_ASAN', 1)
 endif
 
-glib_dep = dependency('glib-2.0', version: '>=2.56')
+glib_dep = dependency('glib-2.0', version: '>=2.74')
 gobject_dep = dependency('gobject-2.0')
 gmodule_dep = dependency('gmodule-2.0')
 gio_dep = dependency('gio-2.0')
@@ -240,6 +247,7 @@ libsoup_dep = dependency('libsoup-3.0')
 gum_dep = dependency('frida-gum-1.0')
 gumjs_dep = dependency('frida-gumjs-1.0')
 gumjs_inspector_dep = dependency('frida-gumjs-inspector-1.0')
+quickjs_dep = dependency('quickjs', required: false)
 brotlidec_dep = dependency('libbrotlidec')
 
 have_v8 = gumjs_dep.get_variable('gumjs_v8') == 'enabled'
@@ -253,7 +261,7 @@ else
   v8_mksnapshot = ''
 endif
 
-native_glib_dep = dependency('glib-2.0', version: '>=2.56', native: true)
+native_glib_dep = dependency('glib-2.0', version: '>=2.74', native: true)
 native_gio_dep = dependency('gio-2.0', native: true)
 native_gee_dep = dependency('gee-0.8', native: true)
 native_brotlienc_dep = dependency('libbrotlienc', native: true)
@@ -264,6 +272,14 @@ endif
 
 backend_deps_private = []
 backend_libs_private = []
+
+if quickjs_dep.found()
+  backend_deps_private += quickjs_dep
+endif
+
+if host_os_family == 'linux' and cc.has_function('openpty', prefix: '#include <pty.h>')
+  vala_flags += '--define=HAVE_OPENPTY'
+endif
 
 if host_os == 'android'
   libselinux_dep = dependency('libselinux', version: '>=3.0')
@@ -303,7 +319,7 @@ endif
 if host_os == 'macos'
   backend_libs_private += ['-Wl,-framework,AppKit']
 endif
-if host_os == 'ios'
+if host_os in ['ios', 'tvos']
   backend_libs_private += ['-Wl,-framework,CoreGraphics', '-Wl,-framework,UIKit']
 endif
 
@@ -399,7 +415,7 @@ add_project_arguments(native_vala_flags, language: ['vala'], native: true)
 subdir('tools')
 subdir('lib')
 subdir('src')
-if host_os not in ['watchos', 'tvos']
+if host_os != 'watchos'
   subdir('server')
   subdir('portal')
   subdir('inject')

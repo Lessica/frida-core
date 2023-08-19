@@ -1,5 +1,7 @@
 #include "frida-helper-backend.h"
 
+#include "frida-tvos.h"
+
 #include <capstone.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -78,7 +80,7 @@
     goto bsd_failure; \
   }
 
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
 # define CORE_FOUNDATION "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
 #else
 # define CORE_FOUNDATION "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"
@@ -164,6 +166,7 @@ struct _FridaSpawnInstance
   __Request__exception_raise_state_identity_t pending_request;
 
   GumDarwinModule * dyld;
+  size_t dyld_size;
   FridaDyldFlavor dyld_flavor;
 
   FridaBreakpointPhase breakpoint_phase;
@@ -385,8 +388,8 @@ static gboolean frida_spawn_instance_is_libc_initialized (FridaSpawnInstance * s
 static void frida_spawn_instance_set_libc_initialized (FridaSpawnInstance * self);
 static kern_return_t frida_spawn_instance_create_dyld_data (FridaSpawnInstance * self);
 static void frida_spawn_instance_destroy_dyld_data (FridaSpawnInstance * self);
-#ifdef HAVE_IOS
-static gboolean frida_pick_ios_bootstrapper (const GumModuleDetails * details, gpointer user_data);
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
+static gboolean frida_pick_ios_tvos_bootstrapper (const GumModuleDetails * details, gpointer user_data);
 #endif
 static void frida_spawn_instance_unset_helpers (FridaSpawnInstance * self);
 static void frida_spawn_instance_call_set_helpers (FridaSpawnInstance * self, GumDarwinUnifiedThreadState * state, mach_vm_address_t helpers);
@@ -400,7 +403,8 @@ static void frida_spawn_instance_disable_nth_breakpoint (FridaSpawnInstance * se
 static guint32 frida_spawn_instance_put_software_breakpoint (FridaSpawnInstance * self, GumAddress where, guint index);
 static guint32 frida_spawn_instance_overwrite_arm64_instruction (FridaSpawnInstance * self, GumAddress address, guint32 new_instruction);
 
-static void frida_make_pipe (int fds[2]);
+static void frida_make_pty (int fds[2]);
+static void frida_configure_terminal_attributes (gint fd);
 
 static FridaInjectInstance * frida_inject_instance_new (FridaDarwinHelperBackend * backend, guint id, guint pid);
 static FridaInjectInstance * frida_inject_instance_clone (const FridaInjectInstance * instance, guint id);
@@ -826,9 +830,9 @@ _frida_darwin_helper_backend_spawn (FridaDarwinHelperBackend * self, const gchar
       break;
 
     case FRIDA_STDIO_PIPE:
-      frida_make_pipe (stdin_pipe);
-      frida_make_pipe (stdout_pipe);
-      frida_make_pipe (stderr_pipe);
+      frida_make_pty (stdin_pipe);
+      frida_make_pty (stdout_pipe);
+      frida_make_pty (stderr_pipe);
 
       *pipes = frida_stdio_pipes_new (stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]);
 
@@ -962,7 +966,7 @@ invalid_pid:
   }
 }
 
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
 
 #import "springboard.h"
 
@@ -970,13 +974,17 @@ static void frida_darwin_helper_backend_launch_using_fbs (NSString * identifier,
     FridaDarwinHelperBackendLaunchCompletionHandler on_complete, void * on_complete_target);
 static void frida_darwin_helper_backend_launch_using_sbs (NSString * identifier, NSURL * url, FridaHostSpawnOptions * spawn_options,
     FridaDarwinHelperBackendLaunchCompletionHandler on_complete, void * on_complete_target);
+#ifdef HAVE_TVOS
+static void frida_darwin_helper_backend_launch_using_lsaw (NSString * identifier, NSURL * url, FridaHostSpawnOptions * spawn_options,
+    FridaDarwinHelperBackendLaunchCompletionHandler on_complete, void * on_complete_target);
+#endif
 
 static guint frida_kill_application (NSString * identifier);
+static gboolean frida_has_active_prewarm (gint pid);
+static guint8 * frida_skip_string (guint8 * cursor, guint8 * end);
 
 static NSArray * frida_argv_to_arguments_array (gchar * const * argv, gint argv_length);
 static NSDictionary * frida_envp_to_environment_dictionary (gchar * const * envp, gint envp_length);
-
-static void frida_configure_terminal_attributes (gint fd);
 
 static gboolean frida_find_uikit (const gchar * dependency, gboolean * has_uikit);
 
@@ -1001,6 +1009,11 @@ _frida_darwin_helper_backend_launch (const gchar * identifier, FridaHostSpawnOpt
       goto invalid_url;
     url_value = [NSURL URLWithString:[NSString stringWithUTF8String:g_variant_get_string (url, NULL)]];
   }
+
+#ifdef HAVE_TVOS
+  frida_darwin_helper_backend_launch_using_lsaw (identifier_value, url_value, options, on_complete, on_complete_target);
+  goto beach;
+#endif
 
   if (_frida_get_springboard_api ()->fbs != NULL)
   {
@@ -1128,7 +1141,7 @@ frida_darwin_helper_backend_launch_using_fbs (NSString * identifier, NSURL * url
       pending_error = g_error_new (
           FRIDA_ERROR,
           FRIDA_ERROR_NOT_SUPPORTED,
-          "Unable to launch iOS app: %s",
+          "Unable to launch iOS app via FBS: %s",
           [[error localizedDescription] UTF8String]);
     }
 
@@ -1247,7 +1260,7 @@ frida_darwin_helper_backend_launch_using_sbs (NSString * identifier, NSURL * url
       error = g_error_new (
           FRIDA_ERROR,
           FRIDA_ERROR_NOT_SUPPORTED,
-          "Unable to launch iOS app: %s",
+          "Unable to launch iOS app via SBS: %s",
           [api->SBSApplicationLaunchingErrorString (res) UTF8String]);
     }
 
@@ -1311,6 +1324,100 @@ failure:
   }
 }
 
+#ifdef HAVE_TVOS
+
+static void
+frida_darwin_helper_backend_launch_using_lsaw (NSString * identifier, NSURL * url, FridaHostSpawnOptions * spawn_options,
+    FridaDarwinHelperBackendLaunchCompletionHandler on_complete, void * on_complete_target)
+{
+  FridaSpringboardApi * api;
+  GError * error = NULL;
+  BOOL opened = NO;
+
+  if (spawn_options->has_argv)
+    goto argv_not_supported;
+
+  if (spawn_options->has_envp)
+    goto envp_not_supported;
+
+  if (spawn_options->has_env)
+    goto env_not_supported;
+
+  if (strlen (spawn_options->cwd) > 0)
+    goto cwd_not_supported;
+
+  if (spawn_options->stdio != FRIDA_STDIO_INHERIT)
+    goto stdio_not_supported;
+
+  api = _frida_get_springboard_api ();
+
+  frida_kill_application (identifier);
+
+  if (url != nil)
+    opened = [[api->LSApplicationWorkspace defaultWorkspace] openURL:url];
+  else
+    opened = [[api->LSApplicationWorkspace defaultWorkspace] openApplicationWithBundleID:identifier];
+  if (!opened)
+  {
+    error = g_error_new (
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "Unable to launch tvOS app via LSAW");
+    goto failure;
+  }
+
+  on_complete (NULL, NULL, on_complete_target);
+  return;
+
+argv_not_supported:
+  {
+    error = g_error_new_literal (
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "The 'argv' option is not supported when spawning tvOS apps");
+    goto failure;
+  }
+envp_not_supported:
+  {
+    error = g_error_new_literal (
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "The 'envp' option is not supported when spawning tvOS apps");
+    goto failure;
+  }
+env_not_supported:
+  {
+    error = g_error_new_literal (
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "The 'env' option is not supported when spawning tvOS apps");
+    goto failure;
+  }
+cwd_not_supported:
+  {
+    error = g_error_new_literal (
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "The 'cwd' option is not supported when spawning tvOS apps");
+    goto failure;
+  }
+stdio_not_supported:
+  {
+    error = g_error_new_literal (
+        FRIDA_ERROR,
+        FRIDA_ERROR_NOT_SUPPORTED,
+        "The 'stdio' option is not supported when spawning tvOS apps");
+    goto failure;
+  }
+failure:
+  {
+    on_complete (NULL, error, on_complete_target);
+    return;
+  }
+}
+
+#endif
+
 void
 _frida_darwin_helper_backend_kill_process (guint pid)
 {
@@ -1352,7 +1459,7 @@ _frida_darwin_helper_backend_kill_application (const gchar * identifier)
 static guint
 frida_kill_application (NSString * identifier)
 {
-  guint killed_pid = 0;
+  gint killed_pid = 0;
   FridaSpringboardApi * api;
   GTimer * timer;
   const double kill_timeout = 3.0;
@@ -1367,15 +1474,25 @@ frida_kill_application (NSString * identifier)
     service = [api->FBSSystemService sharedService];
 
     killed_pid = [service pidForApplication:identifier];
+    if (killed_pid <= 0)
+      goto beach;
 
-    [service terminateApplication:identifier
-                        forReason:FBProcessKillReasonUser
-                        andReport:NO
-                  withDescription:@"killed from Frida"];
+    if (frida_has_active_prewarm (killed_pid))
+    {
+      kill (killed_pid, SIGKILL);
+    }
+    else
+    {
+      [service terminateApplication:identifier
+                          forReason:FBProcessKillReasonUser
+                          andReport:NO
+                    withDescription:@"killed from Frida"];
+
+    }
 
     timer = g_timer_new ();
 
-    while ([service pidForApplication:identifier] > 0 && g_timer_elapsed (timer, NULL) < kill_timeout)
+    while ((killed_pid = [service pidForApplication:identifier]) > 0 && g_timer_elapsed (timer, NULL) < kill_timeout)
     {
       g_usleep (10000);
     }
@@ -1438,9 +1555,8 @@ frida_kill_application (NSString * identifier)
         g_timer_destroy (timer);
 
         found = TRUE;
-
-        [cur release];
       }
+      [cur release];
     }
   }
 
@@ -1448,6 +1564,71 @@ beach:
   g_free (processes);
 
   return killed_pid;
+}
+
+static gboolean
+frida_has_active_prewarm (gint pid)
+{
+  gboolean prewarm_active = FALSE;
+  int mib_argmax[] = { CTL_KERN, KERN_ARGMAX };
+  int mib_args[] = { CTL_KERN, KERN_PROCARGS2, 0 };
+  guint8 * buffer;
+  size_t size;
+  gint32 arg_max, argc;
+  guint8 * cursor, * end;
+
+  buffer = NULL;
+  size = sizeof (arg_max);
+
+  arg_max = 0;
+  if (sysctl (mib_argmax, G_N_ELEMENTS (mib_argmax), &arg_max, &size, NULL, 0) != 0)
+    goto beach;
+
+  buffer = g_malloc (arg_max);
+  if (buffer == NULL)
+    goto beach;
+
+  mib_args[2] = pid;
+  size = arg_max;
+
+  if (sysctl (mib_args, G_N_ELEMENTS (mib_args), buffer, &size, NULL, 0) != 0)
+    goto beach;
+
+  argc = *(gint32 *) buffer;
+  end = buffer + size;
+  cursor = buffer + sizeof (argc);
+
+  /* Skip executable name */
+  cursor = frida_skip_string (cursor, end);
+
+  /* Skip args */
+  while (argc-- != 0)
+    cursor = frida_skip_string (cursor, end);
+
+  /* Iterate environment */
+  while (cursor != end)
+  {
+    if (strstr ((char *) cursor, "ActivePrewarm=1") != NULL)
+    {
+      prewarm_active = true;
+      break;
+    }
+    cursor = frida_skip_string (cursor, end);
+  }
+
+beach:
+  g_free (buffer);
+
+  return prewarm_active;
+}
+
+static guint8 *
+frida_skip_string (guint8 * cursor, guint8 * end)
+{
+  while (cursor != end && *cursor != '\0')
+    cursor++;
+
+  return ++cursor;
 }
 
 static NSArray *
@@ -1502,20 +1683,6 @@ frida_envp_to_environment_dictionary (gchar * const * envp, gint envp_length)
   }
 
   return result;
-}
-
-static void
-frida_configure_terminal_attributes (gint fd)
-{
-  struct termios tios;
-
-  tcgetattr (fd, &tios);
-
-  tios.c_oflag &= ~ONLCR;
-  tios.c_cflag = (tios.c_cflag & CLOCAL) | CS8 | CREAD | HUPCL;
-  tios.c_lflag &= ~ECHO;
-
-  tcsetattr (fd, 0, &tios);
 }
 
 gboolean
@@ -1716,6 +1883,7 @@ _frida_darwin_helper_backend_prepare_spawn_instance_for_injection (FridaDarwinHe
     "__ZN4dyldL17launchWithClosureEPKN5dyld37closure13LaunchClosureEPK15DyldSharedCachePKNS0_11MachOLoadedEmiPPKcSD_SD_PmSE_",
   };
   GumDarwinModule * dyld;
+  const GumDarwinSegment * segment;
   FridaExceptionPortSet * previous_ports;
   dispatch_source_t source;
 
@@ -1843,6 +2011,16 @@ _frida_darwin_helper_backend_prepare_spawn_instance_for_injection (FridaDarwinHe
 
   dyld = gum_darwin_module_new_from_memory ("/usr/lib/dyld", task, dyld_header, GUM_DARWIN_MODULE_FLAGS_NONE, NULL);
   instance->dyld = dyld;
+  instance->dyld_size = 0;
+  i = 0;
+  while ((segment = gum_darwin_module_get_nth_segment (dyld, i++)) != NULL)
+  {
+    if (strcmp (segment->name, "__TEXT") == 0)
+    {
+      instance->dyld_size = segment->vm_size;
+      break;
+    }
+  }
 
   modern_entry_address = gum_darwin_module_resolve_symbol_address (dyld, "__ZN5dyld44APIs19_libdyld_initializeEPKNS_16LibSystemHelpersE");
   instance->dyld_flavor = (modern_entry_address != 0) ? FRIDA_DYLD_V4_PLUS : FRIDA_DYLD_V3_MINUS;
@@ -1853,7 +2031,11 @@ _frida_darwin_helper_backend_prepare_spawn_instance_for_injection (FridaDarwinHe
 
     instance->info_ptr_address = gum_darwin_module_resolve_symbol_address (dyld, "_gProcessInfo");
     if (instance->info_ptr_address == 0)
-      goto dyld_probe_failed;
+    {
+      instance->info_ptr_address = gum_darwin_module_resolve_symbol_address (dyld, "__ZN5dyld412gProcessInfoE");
+      if (instance->info_ptr_address == 0)
+        goto dyld_probe_failed;
+    }
   }
   else
   {
@@ -2452,7 +2634,7 @@ frida_inject_instance_on_mach_thread_dead (void * context)
 
     self->agent_context->posix_thread = MACH_PORT_NULL;
 
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
     port_might_be_guarded = gum_darwin_check_xnu_version (7938, 0, 0);
 #else
     port_might_be_guarded = FALSE;
@@ -2929,6 +3111,7 @@ next_phase:
       GumAddress frame_pointer = 0;
       guint64 * ret_addr_data;
       GumAddress libsystem_initializer_caller;
+      gboolean falls_within_dyld;
 
 #if defined (HAVE_I386)
       frame_pointer = state->uts.ts64.__rbp;
@@ -2936,14 +3119,29 @@ next_phase:
       frame_pointer = __darwin_arm_thread_state64_get_fp (state->ts_64);
 #endif
 
-      ret_addr_data = (guint64 *) gum_darwin_read (self->task, frame_pointer + 8, 8, NULL);
-      libsystem_initializer_caller = *ret_addr_data;
+      do
+      {
+        ret_addr_data = (guint64 *) gum_darwin_read (self->task, frame_pointer + 8, 8, NULL);
+        libsystem_initializer_caller = *ret_addr_data;
 #ifdef HAVE_ARM64
-      libsystem_initializer_caller &= G_GUINT64_CONSTANT (0x7fffffffff);
+        libsystem_initializer_caller &= G_GUINT64_CONSTANT (0x7fffffffff);
 #endif
-      g_free (ret_addr_data);
+        g_free (ret_addr_data);
+
+        falls_within_dyld = libsystem_initializer_caller >= self->dyld->base_address &&
+            libsystem_initializer_caller < self->dyld->base_address + self->dyld_size;
+
+        if (!falls_within_dyld)
+        {
+          ret_addr_data = (guint64 *) gum_darwin_read (self->task, frame_pointer, 8, NULL);
+          frame_pointer = *ret_addr_data;
+          g_free (ret_addr_data);
+        }
+      }
+      while (!falls_within_dyld);
 
       frida_spawn_instance_set_nth_breakpoint (self, 1, libsystem_initializer_caller, FRIDA_BREAKPOINT_REPEAT_ALWAYS);
+
       self->breakpoint_phase = FRIDA_BREAKPOINT_LIBSYSTEM_INITIALIZED;
 
       return TRUE;
@@ -2975,11 +3173,15 @@ next_phase:
         GHashTableIter iter;
         gpointer strcmp_check;
         guint breakpoint_index;
+        gboolean avoid_breakpoint_conflict = self->fake_helpers != 0 && self->dlerror_clear_address == 0;
 
         g_hash_table_iter_init (&iter, self->do_modinit_strcmp_checks);
         breakpoint_index = 1;
         while (g_hash_table_iter_next (&iter, &strcmp_check, NULL))
         {
+          if (avoid_breakpoint_conflict && breakpoint_index == 2)
+            breakpoint_index++;
+
           frida_spawn_instance_set_nth_breakpoint (self, breakpoint_index, GUM_ADDRESS (strcmp_check), FRIDA_BREAKPOINT_REPEAT_ALWAYS);
           breakpoint_index++;
         }
@@ -3019,7 +3221,7 @@ next_phase:
       return TRUE;
 
     case FRIDA_BREAKPOINT_DLOPEN_BOOTSTRAPPER:
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
       if (self->bootstrapper_name != 0)
       {
         frida_spawn_instance_set_libc_initialized (self);
@@ -3116,7 +3318,6 @@ frida_spawn_instance_handle_dyld_restart (FridaSpawnInstance * self)
   GumAddress * info_ptr;
   struct dyld_all_image_infos * info = NULL;
   GumDarwinModule * dyld = NULL;
-  GumAddress entry_address;
 
   info_ptr = (GumAddress *) gum_darwin_read (self->task, self->info_ptr_address, sizeof (GumAddress), NULL);
   if (info_ptr == NULL)
@@ -3131,16 +3332,12 @@ frida_spawn_instance_handle_dyld_restart (FridaSpawnInstance * self)
   if (dyld == NULL)
     goto beach;
 
-  entry_address = gum_darwin_module_resolve_symbol_address (dyld, "__ZN5dyld44APIs19_libdyld_initializeEPKNS_16LibSystemHelpersE");
-  if (entry_address == 0)
-    goto beach;
-
-  self->modern_entry_address = entry_address;
+  self->modern_entry_address = GUM_ADDRESS (info->dyldImageLoadAddress) + (self->modern_entry_address - self->dyld->base_address);
 
   g_object_unref (self->dyld);
   self->dyld = g_steal_pointer (&dyld);
 
-  frida_spawn_instance_set_nth_breakpoint (self, 0, entry_address, FRIDA_BREAKPOINT_REPEAT_ALWAYS);
+  frida_spawn_instance_set_nth_breakpoint (self, 0, self->modern_entry_address, FRIDA_BREAKPOINT_REPEAT_ALWAYS);
 
   handled = TRUE;
 
@@ -3155,6 +3352,9 @@ beach:
 static gboolean
 frida_spawn_instance_handle_modinit (FridaSpawnInstance * self, GumDarwinUnifiedThreadState * state, GumAddress pc)
 {
+  if (self->do_modinit_strcmp_checks == NULL)
+    return FALSE;
+
   if (g_hash_table_contains (self->do_modinit_strcmp_checks, GSIZE_TO_POINTER (pc)))
   {
 #ifdef HAVE_I386
@@ -3309,8 +3509,8 @@ frida_spawn_instance_create_dyld_data (FridaSpawnInstance * self)
   if (!gum_darwin_query_ptrauth_support (self->task, &ptrauth_support))
     return KERN_FAILURE;
 
-#ifdef HAVE_IOS
-  gum_darwin_enumerate_modules (self->task, frida_pick_ios_bootstrapper, &data);
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
+  gum_darwin_enumerate_modules (self->task, frida_pick_ios_tvos_bootstrapper, &data);
 #endif
 
   ret_gadget = self->ret_gadget;
@@ -3387,10 +3587,10 @@ frida_spawn_instance_destroy_dyld_data (FridaSpawnInstance * self)
   self->dyld_data = 0;
 }
 
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
 
 static gboolean
-frida_pick_ios_bootstrapper (const GumModuleDetails * details, gpointer user_data)
+frida_pick_ios_tvos_bootstrapper (const GumModuleDetails * details, gpointer user_data)
 {
   FridaSpawnInstanceDyldData * data = user_data;
   const gchar * candidates[] = {
@@ -3795,19 +3995,41 @@ frida_spawn_instance_overwrite_arm64_instruction (FridaSpawnInstance * self, Gum
 }
 
 static void
-frida_make_pipe (int fds[2])
+frida_make_pty (int fds[2])
 {
   gboolean pipe_opened;
-  int res;
+  int i;
 
-  pipe_opened = g_unix_open_pipe (fds, FD_CLOEXEC, NULL);
+  pipe_opened = openpty (&fds[0], &fds[1], NULL, NULL, NULL) != -1;
   g_assert (pipe_opened);
 
-  res = fcntl (fds[0], F_SETNOSIGPIPE, TRUE);
-  g_assert (res == 0);
+  for (i = 0; i != 2; i++)
+  {
+    const int fd = fds[i];
+    int res;
 
-  res = fcntl (fds[1], F_SETNOSIGPIPE, TRUE);
-  g_assert (res == 0);
+    res = fcntl (fd, F_SETFD, fcntl (fd, F_GETFD) | FD_CLOEXEC);
+    g_assert (res == 0);
+
+    res = fcntl (fd, F_SETNOSIGPIPE, TRUE);
+    g_assert (res == 0);
+  }
+
+  frida_configure_terminal_attributes (fds[0]);
+}
+
+static void
+frida_configure_terminal_attributes (gint fd)
+{
+  struct termios tios;
+
+  tcgetattr (fd, &tios);
+
+  tios.c_oflag &= ~ONLCR;
+  tios.c_cflag = (tios.c_cflag & CLOCAL) | CS8 | CREAD | HUPCL;
+  tios.c_lflag &= ~ECHO;
+
+  tcsetattr (fd, 0, &tios);
 }
 
 static FridaInjectInstance *
@@ -5091,7 +5313,7 @@ frida_set_hardware_single_step (gpointer debug_state, GumDarwinUnifiedThreadStat
 static gboolean
 frida_is_hardware_breakpoint_support_working (void)
 {
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
   static gsize cached_result = 0;
 
   if (g_once_init_enter (&cached_result))
@@ -5411,24 +5633,34 @@ frida_create_capstone (GumCpuType cpu_type, GumAddress start)
 
   switch (cpu_type)
   {
+#ifdef HAVE_I386
     case GUM_CPU_IA32:
+      cs_arch_register_x86 ();
       err = cs_open (CS_ARCH_X86, CS_MODE_32, &capstone);
       break;
 
     case GUM_CPU_AMD64:
+      cs_arch_register_x86 ();
       err = cs_open (CS_ARCH_X86, CS_MODE_64, &capstone);
       break;
+#endif
 
+#if defined (HAVE_ARM) || defined (HAVE_ARM64)
     case GUM_CPU_ARM:
+      cs_arch_register_arm ();
       if (start & 1)
         err = cs_open (CS_ARCH_ARM, CS_MODE_THUMB, &capstone);
       else
         err = cs_open (CS_ARCH_ARM, CS_MODE_ARM, &capstone);
       break;
+#endif
 
+#ifdef HAVE_ARM64
     case GUM_CPU_ARM64:
+      cs_arch_register_arm64 ();
       err = cs_open (CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, &capstone);
       break;
+#endif
 
     default:
       g_assert_not_reached ();
